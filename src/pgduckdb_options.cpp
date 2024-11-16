@@ -1,8 +1,13 @@
-
 #include "duckdb.hpp"
 
-#include <filesystem>
 #include <fstream>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 extern "C" {
 #include "postgres.h"
@@ -190,26 +195,92 @@ typedef struct CacheFileInfo {
 
 static std::vector<CacheFileInfo>
 DuckdbGetCachedFilesInfos() {
-	std::string ext(".meta");
-	std::vector<CacheFileInfo> cache_info;
-	for (auto &p : std::filesystem::recursive_directory_iterator(CreateOrGetDirectoryPath("duckdb_cache"))) {
-		if (p.path().extension() == ext) {
-			std::ifstream cache_file_metadata(p.path());
-			std::string metadata;
-			std::vector<std::string> metadata_tokens;
-			while (std::getline(cache_file_metadata, metadata, ',')) {
-				metadata_tokens.push_back(metadata);
-			}
-			if (metadata_tokens.size() != 4) {
-				elog(WARNING, "(PGDuckDB/DuckdbGetCachedFilesInfos) Invalid '%s' cache metadata file",
-				     p.path().c_str());
-					 break;
-			}
-			cache_info.push_back(CacheFileInfo {metadata_tokens[0], metadata_tokens[1], std::stoi(metadata_tokens[2]),
-			                                    std::stoi(metadata_tokens[3])});
-		}
-	}
-	return cache_info;
+    std::string ext(".meta");
+    std::vector<CacheFileInfo> cache_info;
+    std::string cache_dir = CreateOrGetDirectoryPath("duckdb_cache");
+
+#ifdef _WIN32
+    // Windows implementation
+    WIN32_FIND_DATAA find_data;
+    std::string search_path = cache_dir + "\\*" + ext;
+    HANDLE find_handle = FindFirstFileA(search_path.c_str(), &find_data);
+    
+    if (find_handle == INVALID_HANDLE_VALUE) {
+        elog(WARNING, "(PGDuckDB/DuckdbGetCachedFilesInfos) Could not open directory '%s'", cache_dir.c_str());
+        return cache_info;
+    }
+
+    do {
+        std::string full_path = cache_dir + "\\" + find_data.cFileName;
+        std::ifstream cache_file_metadata(full_path);
+        std::string metadata;
+        std::vector<std::string> metadata_tokens;
+        
+        while (std::getline(cache_file_metadata, metadata, ',')) {
+            metadata_tokens.push_back(metadata);
+        }
+        
+        if (metadata_tokens.size() != 4) {
+            elog(WARNING, "(PGDuckDB/DuckdbGetCachedFilesInfos) Invalid '%s' cache metadata file",
+                 full_path.c_str());
+            continue;
+        }
+        
+        cache_info.push_back(CacheFileInfo {
+            metadata_tokens[0],
+            metadata_tokens[1],
+            std::stoi(metadata_tokens[2]),
+            std::stoi(metadata_tokens[3])
+        });
+    } while (FindNextFileA(find_handle, &find_data));
+
+    FindClose(find_handle);
+
+#else
+    // POSIX implementation
+    DIR* dir = opendir(cache_dir.c_str());
+    if (dir == nullptr) {
+        elog(WARNING, "(PGDuckDB/DuckdbGetCachedFilesInfos) Could not open directory '%s'", cache_dir.c_str());
+        return cache_info;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type != DT_REG) {  // Skip if not a regular file
+            continue;
+        }
+        
+        std::string filename(entry->d_name);
+        if (filename.length() >= ext.length() && 
+            filename.compare(filename.length() - ext.length(), ext.length(), ext) == 0) {
+            
+            std::string full_path = cache_dir + "/" + filename;
+            std::ifstream cache_file_metadata(full_path);
+            std::string metadata;
+            std::vector<std::string> metadata_tokens;
+            
+            while (std::getline(cache_file_metadata, metadata, ',')) {
+                metadata_tokens.push_back(metadata);
+            }
+            
+            if (metadata_tokens.size() != 4) {
+                elog(WARNING, "(PGDuckDB/DuckdbGetCachedFilesInfos) Invalid '%s' cache metadata file",
+                     full_path.c_str());
+                continue;
+            }
+            
+            cache_info.push_back(CacheFileInfo {
+                metadata_tokens[0],
+                metadata_tokens[1],
+                std::stoi(metadata_tokens[2]),
+                std::stoi(metadata_tokens[3])
+            });
+        }
+    }
+    closedir(dir);
+#endif
+
+    return cache_info;
 }
 
 static bool
